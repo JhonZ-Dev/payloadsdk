@@ -54,6 +54,9 @@
 #include "widget/test_widget_speaker.h"
 #include "widget/test_widget.h"
 #include "data_transmission/test_data_transmission.h"
+#if CONFIG_MODULE_SAMPLE_SENSOR_SIM_ON
+#include "data_transmission/sensor_simulation.h"
+#endif
 #include "tethered_battery/test_tethered_battery.h"
 #include "dji_sdk_config.h"
 #include "pps.h"
@@ -191,6 +194,13 @@ int main(int argc, char **argv)
         returnCode = DjiTest_DataTransmissionStartService();
         if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             USER_LOG_ERROR("data tramsmission sample init error");
+        }
+    #endif
+
+    #if CONFIG_MODULE_SAMPLE_SENSOR_SIM_ON
+        returnCode = DjiTest_SensorSimStartService();
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_ERROR("sensor sim init error");
         }
     #endif
 
@@ -569,6 +579,13 @@ static T_DjiReturnCode DjiUser_CleanSystemEnvironment(void)
         returnCode = DjiTest_DataTransmissionStopService();
         if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             perror("widget sample deinit error");
+        }
+    #endif
+
+    #ifdef CONFIG_MODULE_SAMPLE_SENSOR_SIM_ON
+        returnCode = DjiTest_SensorSimStopService();
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            perror("sensor sim deinit error");
         }
     #endif
 

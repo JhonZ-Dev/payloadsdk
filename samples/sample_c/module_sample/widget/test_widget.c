@@ -242,7 +242,7 @@ void *DjiTest_WidgetTask(void *arg)
             USER_LOG_ERROR("Floating window show message error, stat = 0x%08llX", djiStat);
         }
 
-        osalHandler->TaskSleepMs(200);
+        osalHandler->TaskSleepMs(1000);
     }
 }
 #ifndef __CC_ARM
