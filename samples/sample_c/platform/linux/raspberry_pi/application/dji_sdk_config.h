@@ -52,7 +52,7 @@ extern "C" {
 
 #define CONFIG_MODULE_SAMPLE_WIDGET_ON                      true
 
-#define CONFIG_MODULE_SAMPLE_SENSOR_SIM_ON                  false
+#define CONFIG_MODULE_SAMPLE_SENSOR_SIM_ON                  true
 
 
 #define CONFIG_MODULE_SAMPLE_WIDGET_SPEAKER_ON              true
