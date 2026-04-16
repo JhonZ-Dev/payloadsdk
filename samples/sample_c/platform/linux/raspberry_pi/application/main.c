@@ -29,6 +29,7 @@
 #include <utils/util_misc.h>
 #include <errno.h>
 #include <signal.h>
+#include <string.h>
 #include <power_management/test_power_management.h>
 #include <gimbal_emu/test_payload_gimbal_emu.h>
 #include <fc_subscription/test_fc_subscription.h>
@@ -40,6 +41,7 @@
 #include <payload_collaboration/test_payload_collaboration.h>
 #include <xport/test_payload_xport.h>
 #include <hms/test_hms.h>
+#include "dji_hms_manager.h"
 #include "monitor/sys_monitor.h"
 #include "osal/osal.h"
 #include "osal/osal_fs.h"
@@ -96,6 +98,29 @@ static void *DjiUser_MonitorTask(void *argument);
 static T_DjiReturnCode DjiTest_HighPowerApplyPinInit();
 static T_DjiReturnCode DjiTest_WriteHighPowerApplyPin(E_DjiPowerManagementPinState pinState);
 static void DjiUser_NormalExitHandler(int signalNum);
+static T_DjiReturnCode DjiTest_HmsInfoCallbackPersistent(T_DjiHmsInfoTable hmsInfoTable);
+
+/* Known HMS voltage/power error codes for quick lookup */
+typedef struct {
+    uint32_t code;
+    const char *desc;
+} T_HmsQuickLookup;
+
+static const T_HmsQuickLookup s_hmsVoltageErrors[] = {
+    {0x11000020, "Gimbal payload voltage too high"},
+    {0x11000021, "Gimbal payload voltage too low"},
+    {0x11000024, "Total payload power too high"},
+    {0x11000029, "OSDK voltage too high"},
+    {0x1100002a, "OSDK voltage too low"},
+    {0x1100002d, "Total payload power too high"},
+    {0x1d050a01, "Gimbal voltage too low"},
+    {0x110b0001, "Battery overcurrent"},
+    {0x110b0005, "Battery cell voltage low"},
+    {0x16100010, "Battery output power insufficient"},
+    {0x1610000d, "Critical low battery voltage"},
+    {0x1610000f, "Critical low battery voltage"},
+    {0, NULL}
+};
 
 /* Exported functions definition ---------------------------------------------*/
 int main(int argc, char **argv)
@@ -310,7 +335,22 @@ int main(int argc, char **argv)
         if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             USER_LOG_ERROR("hms test init error");
         }
+
     #endif
+
+    /* Enable HMS error monitoring ALWAYS (independent of HMS_CUSTOMIZATION) */
+    {
+        returnCode = DjiHmsManager_Init();
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_WARN("HMS manager init returned: 0x%08llX (may already be init)", returnCode);
+        }
+        returnCode = DjiHmsManager_RegHmsInfoCallback(DjiTest_HmsInfoCallbackPersistent);
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_ERROR("HMS register callback error: 0x%08llX", returnCode);
+        } else {
+            USER_LOG_INFO("HMS error monitoring enabled");
+        }
+    }
 
 
     #if CONFIG_MODULE_SAMPLE_TETHERED_BATTERY_ON
@@ -648,6 +688,15 @@ static T_DjiReturnCode DjiUser_PrintConsole(const uint8_t *data, uint16_t dataLe
 {
     USER_UTIL_UNUSED(dataLen);
 
+    /* Filter out noisy internal SDK messages from console (still logged to file) */
+    if (strstr((const char *)data, "invalid ack") != NULL ||
+        strstr((const char *)data, "async send retry") != NULL ||
+        strstr((const char *)data, "async send error") != NULL ||
+        strstr((const char *)data, "async timeout") != NULL ||
+        strstr((const char *)data, "data report timeout") != NULL) {
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+    }
+
     printf("%s", data);
 
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
@@ -830,6 +879,38 @@ static void DjiUser_NormalExitHandler(int signalNum)
     }
 
     exit(0);
+}
+
+static T_DjiReturnCode DjiTest_HmsInfoCallbackPersistent(T_DjiHmsInfoTable hmsInfoTable)
+{
+    if (hmsInfoTable.hmsInfoNum == 0) {
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+    }
+
+    for (uint32_t i = 0; i < hmsInfoTable.hmsInfoNum; i++) {
+        uint32_t errCode = hmsInfoTable.hmsInfo[i].errorCode;
+        uint8_t level = hmsInfoTable.hmsInfo[i].errorLevel;
+        uint8_t comp = hmsInfoTable.hmsInfo[i].componentIndex;
+        const char *desc = NULL;
+
+        /* Check known voltage/power errors first */
+        for (uint32_t j = 0; s_hmsVoltageErrors[j].desc != NULL; j++) {
+            if (s_hmsVoltageErrors[j].code == errCode) {
+                desc = s_hmsVoltageErrors[j].desc;
+                break;
+            }
+        }
+
+        if (desc != NULL) {
+            USER_LOG_ERROR("[HMS-VOLTAGE] 0x%08X Lvl:%d Comp:%d => %s",
+                           errCode, level, comp, desc);
+        } else {
+            USER_LOG_WARN("[HMS] 0x%08X Lvl:%d Comp:%d",
+                          errCode, level, comp);
+        }
+    }
+
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 #pragma GCC diagnostic pop

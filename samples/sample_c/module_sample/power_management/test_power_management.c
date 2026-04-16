@@ -117,7 +117,7 @@ T_DjiReturnCode DjiTest_PowerManagementStartService(void)
 
         if (baseInfo.djiAdapterType == DJI_SDK_ADAPTER_TYPE_SKYPORT_V3 ||
             baseInfo.djiAdapterType == DJI_SDK_ADAPTER_TYPE_EPORT_V2_RIBBON_CABLE) {
-            E_DjiHighPowerVoltage voltage = E_DJI_HIGH_POWER_VOLTAGE_17V;
+            E_DjiHighPowerVoltage voltage = E_DJI_HIGH_POWER_VOLTAGE_13V6;
 
             USER_LOG_INFO("Start to apply high power.");
 
