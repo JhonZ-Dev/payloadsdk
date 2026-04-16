@@ -1,13 +1,14 @@
 /**
  ********************************************************************
  * @file    sensor_simulation.c
- * @brief   Read real RDO Blue sensor data from shared JSON file and send them
- *          to the remote controller via data transmission APIs.
- *          The data is written continuously by the Python reader script.
+ * @brief   Read real RDO Blue sensor data via native Modbus RTU (C) and send
+ *          them to the remote controller via data transmission APIs.
+ *          No external Python script needed.
  *********************************************************************
  */
 
 #include "sensor_simulation.h"
+#include "rdo_modbus.h"
 #include "dji_logger.h"
 #include "dji_platform.h"
 #include "utils/util_misc.h"
@@ -20,18 +21,34 @@
 #include <string.h>
 
 /* Private constants ---------------------------------------------------------*/
-#define SENSOR_SIM_TASK_FREQ_MS        (2000)
+#define SENSOR_SIM_TASK_FREQ_MS        (5000)
 #define SENSOR_SIM_TASK_STACK_SIZE     (2048)
-#define SHARED_SENSOR_DATA_FILE        "/tmp/rdo_sensor_data.json"
 #define GPS_POSITION_SCALE             (10000000.0)
+
+/* Serial port for the RS-485 adapter connected to RDO Blue sensor */
+#define RDO_SERIAL_PORT "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5958032059-if00"
 
 /* Private variables ---------------------------------------------------------*/
 static T_DjiTaskHandle s_sensorSimThread = 0;
 static bool s_gpsTopicSubscribed = false;
+static bool s_modbusInitialized = false;
+static T_DjiAircraftInfoBaseInfo s_aircraftInfoBaseInfo;
 
 /* Private functions ---------------------------------------------------------*/
 static void *SensorSim_Task(void *arg);
-static int SensorSim_ReadJsonData(float *temperature, float *oxygen, float *saturation, float *partial_pressure);
+
+/* Receive callbacks (needed so SDK opens bidirectional channel to MSDK) */
+static T_DjiReturnCode SensorSim_ReceiveDataFromMobile(const uint8_t *data, uint16_t len)
+{
+    USER_LOG_INFO("sensor sim: received %d bytes from MSDK", len);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode SensorSim_ReceiveDataFromPayloadChannel(const uint8_t *data, uint16_t len)
+{
+    USER_LOG_DEBUG("sensor sim: received %d bytes from payload channel", len);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
 
 T_DjiReturnCode DjiTest_SensorSimStartService(void)
 {
@@ -41,6 +58,71 @@ T_DjiReturnCode DjiTest_SensorSimStartService(void)
     if (osalHandler == NULL) {
         USER_LOG_ERROR("osal handler is null");
         return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+
+    /* Initialize Modbus RTU communication with RDO Blue sensor */
+    if (RdoModbus_Init(RDO_SERIAL_PORT) == 0) {
+        s_modbusInitialized = true;
+        USER_LOG_INFO("sensor sim: RDO Blue Modbus RTU initialized on %s", RDO_SERIAL_PORT);
+    } else {
+        s_modbusInitialized = false;
+        USER_LOG_WARN("sensor sim: RDO Blue Modbus init failed, will use fallback data");
+    }
+
+    /* Initialize low-speed data channel for sending sensor data */
+    returnCode = DjiLowSpeedDataChannel_Init();
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("sensor sim: low speed data channel init error: 0x%08X", returnCode);
+        return returnCode;
+    }
+
+    /* Get aircraft info for M400-specific channel setup */
+    returnCode = DjiAircraftInfo_GetBaseInfo(&s_aircraftInfoBaseInfo);
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_WARN("sensor sim: get aircraft base info failed: 0x%08X", returnCode);
+    }
+
+    /* Register receive callback for MSDK channel (required for bidirectional pipe) */
+    returnCode = DjiLowSpeedDataChannel_RegRecvDataCallback(DJI_CHANNEL_ADDRESS_MASTER_RC_APP,
+                                                            SensorSim_ReceiveDataFromMobile);
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("sensor sim: register MSDK recv callback error: 0x%08X", returnCode);
+    }
+
+    /* M400: register all payload/extension-v2 channels for PSDK<->MSDK data */
+    if (s_aircraftInfoBaseInfo.aircraftType == DJI_AIRCRAFT_TYPE_M400) {
+        const E_DjiChannelAddress m400Channels[] = {
+            DJI_CHANNEL_ADDRESS_PAYLOAD_PORT_NO1,
+            DJI_CHANNEL_ADDRESS_PAYLOAD_PORT_NO2,
+            DJI_CHANNEL_ADDRESS_PAYLOAD_PORT_NO3,
+            DJI_CHANNEL_ADDRESS_EXTENSION_PORT_V2_NO4,
+            DJI_CHANNEL_ADDRESS_EXTENSION_PORT_V2_NO5,
+            DJI_CHANNEL_ADDRESS_EXTENSION_PORT_V2_NO6,
+            DJI_CHANNEL_ADDRESS_EXTENSION_PORT_V2_NO7,
+            DJI_CHANNEL_ADDRESS_EXTENSION_PORT_V2_NO8,
+        };
+        for (uint8_t i = 0; i < sizeof(m400Channels) / sizeof(m400Channels[0]); i++) {
+            returnCode = DjiLowSpeedDataChannel_RegRecvDataCallback(m400Channels[i],
+                                                                    SensorSim_ReceiveDataFromPayloadChannel);
+            if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+                USER_LOG_WARN("sensor sim: register M400 channel %d callback error: 0x%08X", m400Channels[i], returnCode);
+            }
+        }
+        USER_LOG_INFO("sensor sim: M400 PSDK<->MSDK channels registered");
+    } else if (s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1 ||
+               s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO2 ||
+               s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO3) {
+        returnCode = DjiLowSpeedDataChannel_RegRecvDataCallback(DJI_CHANNEL_ADDRESS_EXTENSION_PORT,
+                                                                SensorSim_ReceiveDataFromPayloadChannel);
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_WARN("sensor sim: register extension port recv callback error: 0x%08X", returnCode);
+        }
+    } else if (s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_EXTENSION_PORT) {
+        returnCode = DjiLowSpeedDataChannel_RegRecvDataCallback(DJI_CHANNEL_ADDRESS_PAYLOAD_PORT_NO1,
+                                                                SensorSim_ReceiveDataFromPayloadChannel);
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_WARN("sensor sim: register payload port recv callback error: 0x%08X", returnCode);
+        }
     }
 
     returnCode = DjiFcSubscription_Init();
@@ -82,6 +164,13 @@ T_DjiReturnCode DjiTest_SensorSimStopService(void)
         s_gpsTopicSubscribed = false;
     }
 
+    if (s_modbusInitialized) {
+        RdoModbus_DeInit();
+        s_modbusInitialized = false;
+    }
+
+    DjiLowSpeedDataChannel_DeInit();
+
     if (osalHandler->TaskDestroy(s_sensorSimThread) != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         USER_LOG_ERROR("sensor sim task destroy error.");
         return DJI_ERROR_SYSTEM_MODULE_CODE_UNKNOWN;
@@ -89,49 +178,19 @@ T_DjiReturnCode DjiTest_SensorSimStopService(void)
 
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
-static int SensorSim_ReadJsonData(float *temperature, float *oxygen, float *saturation, float *partial_pressure)
-{
-    FILE *fp = fopen(SHARED_SENSOR_DATA_FILE, "r");
-    if (fp == NULL) {
-        USER_LOG_DEBUG("Sensor data file not available yet: %s", SHARED_SENSOR_DATA_FILE);
-        return -1;
-    }
-
-    char buffer[256];
-    if (fgets(buffer, sizeof(buffer), fp) == NULL) {
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
-
-    /* Simple JSON parsing (assumes fixed format from Python script) */
-    /* Expected: {"timestamp_ms": ..., "temperature_c": X, "dissolved_oxygen_mg_l": Y, ...} */
-    if (sscanf(buffer, 
-               "{\"timestamp_ms\": %*d, \"temperature_c\": %f, \"dissolved_oxygen_mg_l\": %f, \"do_saturation_percent\": %f, \"oxygen_partial_pressure_torr\": %f",
-               temperature, oxygen, saturation, partial_pressure) != 4) {
-        USER_LOG_DEBUG("Failed to parse sensor JSON: %s", buffer);
-        return -1;
-    }
-
-    return 0;
-}
 static void *SensorSim_Task(void *arg)
 {
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
     T_DjiReturnCode djiStat;
     E_DjiChannelAddress channelAddress;
-    T_DjiAircraftInfoBaseInfo aircraftInfoBaseInfo;
     USER_UTIL_UNUSED(arg);
 
-    if (DjiAircraftInfo_GetBaseInfo(&aircraftInfoBaseInfo) != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        USER_LOG_WARN("get aircraft base info fail in sensor sim");
-    }
-
-    USER_LOG_INFO("SensorSim_Task: Starting to read from %s", SHARED_SENSOR_DATA_FILE);
+    USER_LOG_INFO("SensorSim_Task: RDO Modbus reader active (period=%dms)", SENSOR_SIM_TASK_FREQ_MS);
 
     while (1) {
         osalHandler->TaskSleepMs(SENSOR_SIM_TASK_FREQ_MS);
 
+        /* --- GPS --- */
         T_DjiFcSubscriptionGpsPosition gpsPosition = {0};
         T_DjiDataTimestamp gpsTimestamp = {0};
         double longitudeDeg = 0.0;
@@ -152,76 +211,70 @@ static void *SensorSim_Task(void *arg)
             }
         }
 
-        /* Try to read real sensor data from shared JSON file */
+        /* --- Sensor reading --- */
         float temperature = 0.0f;
         float oxygen = 0.0f;
         float saturation = 0.0f;
         float partial_pressure = 0.0f;
+        int sensorOk = 0;
+        uint64_t sensorTsMs = 0;
 
-        if (SensorSim_ReadJsonData(&temperature, &oxygen, &saturation, &partial_pressure) == 0) {
-            /* Successfully read real data from Python/RDO Blue sensor */
+        /* Keep sensorData in outer scope so we can use its timestamp */
+        T_RdoSensorData sensorData = {0};
+        if (s_modbusInitialized) {
+            if (RdoModbus_ReadSensorData(&sensorData) == 0) {
+                temperature = sensorData.temperature_c;
+                oxygen = sensorData.dissolved_oxygen_mg_l;
+                saturation = sensorData.do_saturation_percent;
+                partial_pressure = sensorData.oxygen_partial_pressure_torr;
+                sensorTsMs = sensorData.timestamp_ms;
+                sensorOk = 1;
+            } else {
+                USER_LOG_WARN("sensor sim: Modbus read failed, retrying next cycle");
+            }
+        }
+
+        if (!sensorOk) {
+            USER_LOG_WARN("sensor sim: no valid data, skipping send");
+            continue;
+        }
+
+        /* --- Build and send payload --- */
+        /* Prefer sensor-provided timestamp (ms since epoch). Fallback to OSAL time if missing. */
+        uint64_t usedTsMs = sensorTsMs;
+        if (usedTsMs == 0) {
             uint32_t currentTimeMs = 0;
             osalHandler->GetTimeMs(&currentTimeMs);
-            
-            char payload[320];
-            int len = snprintf(payload, sizeof(payload), 
-                           "{\"type\":\"sensor\",\"temp\":%.2f,\"oxi\":%.2f,\"sat\":%.2f,\"pp\":%.2f,\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.2f,\"gps_valid\":%u,\"ts\":%u}",
-                           temperature, oxygen, saturation, partial_pressure,
-                           latitudeDeg, longitudeDeg, altitudeM, gpsValid,
-                           (unsigned int)(currentTimeMs / 1000));
+            usedTsMs = (uint64_t)currentTimeMs;
+        }
 
-            /* Send to mobile/RC first */
-            channelAddress = DJI_CHANNEL_ADDRESS_MASTER_RC_APP;
-            djiStat = DjiLowSpeedDataChannel_SendData(channelAddress, (const uint8_t *)payload, (uint16_t)len);
-            if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                USER_LOG_ERROR("sensor sim: send data to mobile error.");
-            } else {
-                USER_LOG_DEBUG("sensor sim: sent real RDO data: %s", payload);
-                DjiTest_WidgetLogAppend("RDO Real: T=%.1f°C O2=%.1fmg/L Sat=%.1f%%", temperature, oxygen, saturation);
-            }
+        char payload[256];
+        int len = snprintf(payload, sizeof(payload),
+                       "{\"t\":%.1f,\"o\":%.2f,\"s\":%.1f,\"p\":%.1f,\"la\":%.7f,\"lo\":%.7f,\"a\":%.1f,\"g\":%u,\"ts\":%llu}",
+                       temperature, oxygen, saturation, partial_pressure,
+                       latitudeDeg, longitudeDeg, altitudeM, gpsValid,
+                       (unsigned long long)(usedTsMs / 1ULL));
+        if (len >= (int)sizeof(payload)) len = (int)sizeof(payload) - 1;
 
-            /* Also send to extension/payload ports depending on mount */
-            if (aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1 ||
-                aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO2 ||
-                aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO3) {
-                channelAddress = DJI_CHANNEL_ADDRESS_EXTENSION_PORT;
-                djiStat = DjiLowSpeedDataChannel_SendData(channelAddress, (const uint8_t *)payload, (uint16_t)len);
-                if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                    USER_LOG_ERROR("sensor sim: send data to extension port error.");
-                }
-            } else if (aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_EXTENSION_PORT) {
-                channelAddress = DJI_CHANNEL_ADDRESS_PAYLOAD_PORT_NO1;
-                djiStat = DjiLowSpeedDataChannel_SendData(channelAddress, (const uint8_t *)payload, (uint16_t)len);
-                if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                    USER_LOG_ERROR("sensor sim: send data to payload port error.");
-                }
-            }
+        /* Send to mobile/RC */
+        channelAddress = DJI_CHANNEL_ADDRESS_MASTER_RC_APP;
+        djiStat = DjiLowSpeedDataChannel_SendData(channelAddress, (const uint8_t *)payload, (uint16_t)len);
+        if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_ERROR("sensor sim: send data to mobile error.");
         } else {
-            /* Fallback: generate synthetic data if Python reader is not running */
-            uint32_t t = 0;
-            uint16_t randomNum1 = 0;
-            uint16_t randomNum2 = 0;
-            
-            osalHandler->GetTimeMs(&t);
-            osalHandler->GetRandomNum(&randomNum1);
-            osalHandler->GetRandomNum(&randomNum2);
-            
-            float temperature_sim = 20.0f + (float)(randomNum1 % 100) / 10.0f;
-            float oxygen_sim = 8.0f + (float)(randomNum2 % 50) / 10.0f;
-            float saturation_sim = 80.0f + (float)(randomNum1 % 200) / 10.0f;
-            float partial_pressure_sim = 100.0f + (float)(randomNum2 % 100) / 1.0f;
+            USER_LOG_DEBUG("sensor sim: sent REAL data: %s", payload);
+            DjiTest_WidgetLogAppend("RDO: T=%.1f°C O2=%.1fmg/L Sat=%.1f%%", temperature, oxygen, saturation);
+        }
 
-            char payload[300];
-            int len = snprintf(payload, sizeof(payload), "{\"type\":\"sensor\",\"temp\":%.2f,\"oxi\":%.2f,\"sat\":%.2f,\"pp\":%.2f,\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.2f,\"gps_valid\":%u,\"ts\":%u}",
-                           temperature_sim, oxygen_sim, saturation_sim, partial_pressure_sim, latitudeDeg, longitudeDeg, altitudeM, gpsValid, (unsigned int)(t / 1000));
-
-            channelAddress = DJI_CHANNEL_ADDRESS_MASTER_RC_APP;
+        /* Also send to extension/payload ports depending on mount */
+        if (s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1 ||
+            s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO2 ||
+            s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_PAYLOAD_PORT_NO3) {
+            channelAddress = DJI_CHANNEL_ADDRESS_EXTENSION_PORT;
             djiStat = DjiLowSpeedDataChannel_SendData(channelAddress, (const uint8_t *)payload, (uint16_t)len);
-            if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                USER_LOG_ERROR("sensor sim: send fallback data to mobile error.");
-            } else {
-                USER_LOG_DEBUG("sensor sim: sent simulated data (Python reader not running): %s", payload);
-            }
+        } else if (s_aircraftInfoBaseInfo.mountPosition == DJI_MOUNT_POSITION_EXTENSION_PORT) {
+            channelAddress = DJI_CHANNEL_ADDRESS_PAYLOAD_PORT_NO1;
+            djiStat = DjiLowSpeedDataChannel_SendData(channelAddress, (const uint8_t *)payload, (uint16_t)len);
         }
     }
 

@@ -56,11 +56,11 @@
 #include "widget/test_widget_speaker.h"
 #include "widget/test_widget.h"
 #include "data_transmission/test_data_transmission.h"
+#include "tethered_battery/test_tethered_battery.h"
+#include "dji_sdk_config.h"
 #if CONFIG_MODULE_SAMPLE_SENSOR_SIM_ON
 #include "data_transmission/sensor_simulation.h"
 #endif
-#include "tethered_battery/test_tethered_battery.h"
-#include "dji_sdk_config.h"
 #include "pps.h"
 #include "time_sync/test_time_sync.h"
 #include "positioning/test_positioning.h"

@@ -48,7 +48,7 @@ extern "C" {
 * */
 #define CONFIG_MODULE_SAMPLE_POWER_MANAGEMENT_ON            true
 
-#define CONFIG_MODULE_SAMPLE_DATA_TRANSMISSION_ON           true
+#define CONFIG_MODULE_SAMPLE_DATA_TRANSMISSION_ON           false
 
 #define CONFIG_MODULE_SAMPLE_WIDGET_ON                      false
 
